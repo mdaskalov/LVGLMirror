@@ -30,6 +30,7 @@ struct LVGLView: View {
                                 .resizable()
                                 .aspectRatio(contentMode: .fit) // Maintains the 1:1 ratio
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .id(streamManager.frameCounter)
                         }
                     case .error(let message):
                         Text("Error: \(message)")

@@ -20,6 +20,7 @@ enum LVGLStreamState {
 class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
     @Published var streamState: LVGLStreamState = .idle
     @Published var displayImage: NSImage?
+    @Published private(set) var frameCounter: UInt = 0
 
     private var pageBuffer = Data()
     private var streamBuffer = Data()
@@ -30,8 +31,7 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
     private let dataPrefix = "\r\nevent:lvgl\r\ndata:".data(using: .utf8)!
     private let lvglPagePattern = #"<canvas id="canvas" width="(\d+)" height="(\d+)""#
     private let newlineByte: UInt8 = 10
-    
-    
+        
     var isStarted: Bool {
         if case .started = streamState { return true }
         return false
@@ -48,7 +48,11 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
               let match = regex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)) else { return }
         guard let wRange = Range(match.range(at: 1), in: html), let hRange = Range(match.range(at: 2), in: html) else { return }
         if let w = Int(html[wRange]), let h = Int(html[hRange]) {
+            displayImage = NSImage(size: NSSize(width: w, height: h))
             backingStore = LVGLProcessor.backingStore(of: w, h: h)
+            if let backingStore  {
+                displayImage?.addRepresentation(backingStore)
+            }
         }
     }
     
@@ -82,10 +86,11 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
                     }
                     let jsonPayload = streamBuffer.subdata(in: searchStart..<endOfLineRange.lowerBound)
                     streamBuffer.removeSubrange(0..<endOfLineRange.upperBound)
-                    if let backingStore, let displayImage = LVGLProcessor.process(jsonPayload: jsonPayload, backingStore: backingStore) {
+                    if let backingStore {
                         DispatchQueue.main.async {
                             self.streamState = .streaming
-                            self.displayImage = displayImage
+                            LVGLProcessor.process(jsonPayload: jsonPayload, backingStore: backingStore)
+                            self.frameCounter &+= 1
                         }
                     }
                 }
@@ -100,7 +105,8 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
             self.parseLVGLPage(from: String(decoding: pageBuffer, as: UTF8.self))
             if let url = streamingTask?.originalRequest?.url?.deletingLastPathComponent().appendingPathComponent("lvgl_feed") {
                 let config = URLSessionConfiguration.default
-                config.timeoutIntervalForRequest = 0 // No timeout for stream
+                config.timeoutIntervalForRequest = 3600
+                config.waitsForConnectivity = true
                 let session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
                 streamingTask = session.dataTask(with: url)
                 streamState = .configured
