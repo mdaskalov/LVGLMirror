@@ -7,84 +7,60 @@
 
 import SwiftUI
 import Combine
+import Accelerate
 
 enum LVGLStreamState {
     case idle
-    case configure
+    case started
+    case configured
     case streaming
     case error(String)
 }
 
 class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
-    @Published var displayImage: NSImage?
     @Published var streamState: LVGLStreamState = .idle
+    @Published var displayImage: NSImage?
 
-    private var responseBuffer = Data()
+    private var pageBuffer = Data()
+    private var streamBuffer = Data()
     private var streamingTask: URLSessionDataTask?
     private var backingStore: NSBitmapImageRep?
 
     private let processingQueue = DispatchQueue(label: "lvgl.process", qos: .userInitiated)
     private let dataPrefix = "\r\nevent:lvgl\r\ndata:".data(using: .utf8)!
+    private let lvglPagePattern = #"<canvas id="canvas" width="(\d+)" height="(\d+)""#
     private let newlineByte: UInt8 = 10
+    
+    
+    var isStarted: Bool {
+        if case .started = streamState { return true }
+        return false
+    }
+    
+    var isStreaming: Bool {
+        if case .configured = streamState { return true }
+        if case .streaming = streamState { return true }
+        return false
+    }
   
-    private func bitmapImageRep(of w: Int?, h: Int?) -> NSBitmapImageRep? {
-        guard let w, let h,
-              let rep = NSBitmapImageRep(
-                  bitmapDataPlanes: nil,
-                  pixelsWide: w,
-                  pixelsHigh: h,
-                  bitsPerSample: 8,
-                  samplesPerPixel: 3,
-                  hasAlpha: false,
-                  isPlanar: false,
-                  colorSpaceName: .deviceRGB,
-                  bytesPerRow: w * 3,
-                  bitsPerPixel: 24
-              ) else { return nil }
-
-        print("created bitmap: \(w)x\(h) (RGB888)")
-        
-        if let data = rep.bitmapData {
-            memset(data, 0, w * h * 3)
-        }
-        
-        return rep
-    }
-    
     private func parseLVGLPage(from html: String) {
-        let pattern = #"<canvas id="canvas" width="(\d+)" height="(\d+)""#
-        
-        guard let regex = try? NSRegularExpression(pattern: pattern),
+        guard let regex = try? NSRegularExpression(pattern: lvglPagePattern),
               let match = regex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)) else { return }
-        
         guard let wRange = Range(match.range(at: 1), in: html), let hRange = Range(match.range(at: 2), in: html) else { return }
-            
-        backingStore = bitmapImageRep(of: Int(html[wRange]), h: Int(html[hRange]))
-        
-        print("backingStore: \(String(describing: backingStore))")
+        if let w = Int(html[wRange]), let h = Int(html[hRange]) {
+            backingStore = LVGLProcessor.backingStore(of: w, h: h)
+        }
     }
     
-    func fetchSize(from url: URL) {
-        URLSession.shared.dataTask(with: url.appending(path: "/lvgl")) { data,_, _ in
-            if let data {
-                let html = String(decoding: data, as: UTF8.self)
-                DispatchQueue.main.async {
-                    self.parseLVGLPage(from: html)
-                }
-            }
-        }.resume()
-    }
-
     func startStreaming(from url: URL) {
         streamingTask?.cancel()
-        fetchSize(from: url);
+        pageBuffer = Data()
+        streamBuffer = Data()
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 0          // important for long-lived streams
-        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        let session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
-        var request = URLRequest(url: url.appending(path: "/lvgl_feed"))
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-        streamingTask = session.dataTask(with: request)
+        config.timeoutIntervalForRequest = 10
+        let session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
+        streamingTask = session.dataTask(with: url.appendingPathComponent("lvgl"))
+        streamState = .started
         streamingTask?.resume()
     }
 
@@ -93,34 +69,44 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        processingQueue.async { [weak self] in
-            self?.ingestAndProcess(data)
+        if isStarted {
+            pageBuffer.append(data)
+        } else if isStreaming {
+            processingQueue.async { [weak self] in
+                guard let self = self else { return }
+                streamBuffer.append(data)
+                while let prefixRange = streamBuffer.range(of: dataPrefix) {
+                    let searchStart = prefixRange.upperBound
+                    guard let endOfLineRange = streamBuffer.range(of: Data([newlineByte]), in: searchStart..<streamBuffer.count) else {
+                        return // No eol found
+                    }
+                    let jsonPayload = streamBuffer.subdata(in: searchStart..<endOfLineRange.lowerBound)
+                    streamBuffer.removeSubrange(0..<endOfLineRange.upperBound)
+                    if let backingStore, let displayImage = LVGLProcessor.process(jsonPayload: jsonPayload, backingStore: backingStore) {
+                        DispatchQueue.main.async {
+                            self.streamState = .streaming
+                            self.displayImage = displayImage
+                        }
+                    }
+                }
+            }
         }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        if let error = error as NSError?, error.code == NSURLErrorCancelled {
-            print("Cancelled")
-        } else if let error {
-            print("Failed: \(error.localizedDescription)")
-        } else {
-            print("Stream completed")
-        }
-    }
-    
-    private func ingestAndProcess(_ data: Data) {
-        responseBuffer.append(data)
-         while let prefixRange = responseBuffer.range(of: dataPrefix) {
-            let searchStart = prefixRange.upperBound
-            guard let endOfLineRange = responseBuffer.range(of: Data([newlineByte]), in: searchStart..<responseBuffer.count) else {
-                return // No newLine found skip processing
-            }
-            let jsonPayload = responseBuffer.subdata(in: searchStart..<endOfLineRange.lowerBound)
-            responseBuffer.removeSubrange(0..<endOfLineRange.upperBound)
-            if let backingStore, let updatedImage = LVGLProcessor.process(jsonPayload: jsonPayload, backingStore: backingStore) {
-                DispatchQueue.main.async {
-                    self.displayImage = updatedImage
-                }
+        if let error = error as NSError? {
+            streamState = error.code == NSURLErrorCancelled ? .idle : .error(error.localizedDescription)
+        } else if isStarted {
+            self.parseLVGLPage(from: String(decoding: pageBuffer, as: UTF8.self))
+            if let url = streamingTask?.originalRequest?.url?.deletingLastPathComponent().appendingPathComponent("lvgl_feed") {
+                let config = URLSessionConfiguration.default
+                config.timeoutIntervalForRequest = 0 // No timeout for stream
+                let session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
+                streamingTask = session.dataTask(with: url)
+                streamState = .configured
+                streamingTask?.resume()
+            } else {
+                streamState = .error("Can't retrieve stereaming event URL")
             }
         }
     }
