@@ -12,47 +12,108 @@ import Accelerate
 enum LVGLStreamState {
     case idle
     case started
-    case configured
     case streaming
     case error(String)
 }
 
 class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
     @Published var streamState: LVGLStreamState = .idle
-    @Published var displayImage: NSImage?
-    @Published private(set) var frameCounter: UInt = 0
+    @Published var cgImage: CGImage?
+    
+    var aspectRatio: CGFloat = 1.0
 
-    private var pageBuffer = Data()
-    private var streamBuffer = Data()
-    private var streamingTask: URLSessionDataTask?
-    private var backingStore: NSBitmapImageRep?
-
-    private let processingQueue = DispatchQueue(label: "lvgl.process", qos: .userInitiated)
-    private let dataPrefix = "\r\nevent:lvgl\r\ndata:".data(using: .utf8)!
-    private let lvglPagePattern = #"<canvas id="canvas" width="(\d+)" height="(\d+)""#
-    private let newlineByte: UInt8 = 10
-        
-    var isStarted: Bool {
+    var started: Bool {
         if case .started = streamState { return true }
         return false
     }
     
-    var isStreaming: Bool {
-        if case .configured = streamState { return true }
+    var streaming: Bool {
         if case .streaming = streamState { return true }
         return false
     }
-  
+    
+    private var pageBuffer = Data()
+    private var streamBuffer = Data()
+    private var streamingTask: URLSessionDataTask?
+    
+    private var backBuffer = vImage_Buffer()
+    private var pixelBuffer: vImage.PixelBuffer<vImage.Interleaved8x2>?
+    private lazy var format = vImage_CGImageFormat(
+        bitsPerComponent: 5,  // RGB565: 5 bits for R, 6 for G, 5 for B
+        bitsPerPixel: 16,
+        colorSpace: Unmanaged.passRetained(CGColorSpaceCreateDeviceRGB()),
+        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue | CGImageByteOrderInfo.order16Little.rawValue),
+        version: 0,
+        decode: nil,
+        renderingIntent: .defaultIntent
+    )
+    
+    private let processingQueue = DispatchQueue(label: "lvgl.process", qos: .userInitiated)
+    private let dataPrefix = "\r\nevent:lvgl\r\ndata:".data(using: .utf8)!
+    private let lvglPagePattern = #"<canvas id="canvas" width="(\d+)" height="(\d+)""#
+    private let newlineByte: UInt8 = 10
+    
+    private struct LVGLUpdate: Codable, Sendable {
+        let x1, y1, x2, y2: Int
+        let b64: String?
+    }
+    
+    deinit {
+        backBuffer.data.deallocate()
+    }
+ 
     private func parseLVGLPage(from html: String) {
         guard let regex = try? NSRegularExpression(pattern: lvglPagePattern),
               let match = regex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)) else { return }
         guard let wRange = Range(match.range(at: 1), in: html), let hRange = Range(match.range(at: 2), in: html) else { return }
         if let w = Int(html[wRange]), let h = Int(html[hRange]) {
-            displayImage = NSImage(size: NSSize(width: w, height: h))
-            backingStore = LVGLProcessor.backingStore(of: w, h: h)
-            if let backingStore  {
-                displayImage?.addRepresentation(backingStore)
-            }
+            // Allocate back buffer using vImage's alignment-aware allocation
+            print("screen size: \(w)x\(h)")
+            aspectRatio = CGFloat(w) / CGFloat(h)
+            
+            pixelBuffer = vImage.PixelBuffer<vImage.Interleaved8x2>(
+                width: w,
+                height: h
+            )
+            
+            //vImageBuffer_Init(&backBuffer, vImagePixelCount(h), vImagePixelCount(w), 24, vImage_Flags(kvImageNoFlags))
+            // Zero out the buffer initially
+            //memset(backBuffer.data, 0, backBuffer.rowBytes * Int(backBuffer.height))
+        }
+    }
+    
+    private func process(jsonPayload: Data) {
+        guard let update = try? JSONDecoder().decode(LVGLUpdate.self, from: jsonPayload),
+              let b64 = update.b64,
+              let rawImgData = Data(base64Encoded: b64) else { return }
+
+        let width  = update.x2 - update.x1 + 1
+        let height = update.y2 - update.y1 + 1
+        
+        guard width > 0, height > 0 else { return }
+
+        // 1. Prepare Source Buffer (RGB565 from LVGL)
+        rawImgData.withUnsafeBytes { rawPtr in
+            var srcBuffer = vImage_Buffer(
+                data: UnsafeMutableRawPointer(mutating: rawPtr.baseAddress),
+                height: vImagePixelCount(height),
+                width: vImagePixelCount(width),
+                rowBytes: width * 2
+            )
+
+            // 2. Prepare Destination Sub-Buffer (Pointing into our main backBuffer)
+            let byteOffset = update.y1 * backBuffer.rowBytes + update.x1 * 3
+            var destSubBuffer = vImage_Buffer(
+                data: backBuffer.data.advanced(by: byteOffset),
+                height: vImagePixelCount(height),
+                width: vImagePixelCount(width),
+                rowBytes: backBuffer.rowBytes
+            )
+
+            // 3. Hardware Accelerated Conversion
+            vImageConvert_RGB565toRGB888(&srcBuffer, &destSubBuffer, vImage_Flags(kvImageNoFlags))
+            
+            cgImage = try? backBuffer.createCGImage(format: format)
         }
     }
     
@@ -73,9 +134,9 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        if isStarted {
+        if started {
             pageBuffer.append(data)
-        } else if isStreaming {
+        } else if streaming {
             processingQueue.async { [weak self] in
                 guard let self = self else { return }
                 streamBuffer.append(data)
@@ -86,11 +147,9 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
                     }
                     let jsonPayload = streamBuffer.subdata(in: searchStart..<endOfLineRange.lowerBound)
                     streamBuffer.removeSubrange(0..<endOfLineRange.upperBound)
-                    if let backingStore {
+                    if backBuffer.data != nil {
                         DispatchQueue.main.async {
-                            self.streamState = .streaming
-                            LVGLProcessor.process(jsonPayload: jsonPayload, backingStore: backingStore)
-                            self.frameCounter &+= 1
+                            self.process(jsonPayload: jsonPayload)
                         }
                     }
                 }
@@ -99,9 +158,9 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        if let error = error as NSError? {
-            streamState = error.code == NSURLErrorCancelled ? .idle : .error(error.localizedDescription)
-        } else if isStarted {
+        if let err = error as NSError? {
+            streamState = err.code == NSURLErrorCancelled ? .idle : .error(err.localizedDescription)
+        } else if started {
             self.parseLVGLPage(from: String(decoding: pageBuffer, as: UTF8.self))
             if let url = streamingTask?.originalRequest?.url?.deletingLastPathComponent().appendingPathComponent("lvgl_feed") {
                 let config = URLSessionConfiguration.default
@@ -109,7 +168,8 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
                 config.waitsForConnectivity = true
                 let session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
                 streamingTask = session.dataTask(with: url)
-                streamState = .configured
+                cgImage = nil
+                streamState = .streaming
                 streamingTask?.resume()
             } else {
                 streamState = .error("Can't retrieve stereaming event URL")

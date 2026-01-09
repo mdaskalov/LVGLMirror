@@ -9,66 +9,56 @@ import SwiftUI
 
 struct LVGLView: View {
     @StateObject var streamManager = LVGLStreamManager()
-    @State var baseURL: String = "http://office-th:8881"
+    @State var host: String = "core2"
     
     var body: some View {
-        ZStack {
-            Color.black
-                .ignoresSafeArea()
-            VStack {
-                Group {
-                    switch streamManager.streamState {
-                    case .idle:
-                        Spacer()
-                    case .started, .configured:
-                        ProgressView()
-                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                    case .streaming:
-                        if let img = streamManager.displayImage {
-                            Image(nsImage: img)
-                                .interpolation(.none) // Keep pixels sharp
-                                .resizable()
-                                .aspectRatio(contentMode: .fit) // Maintains the 1:1 ratio
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                                .id(streamManager.frameCounter)
+        VStack {
+            Group {
+                switch streamManager.streamState {
+                case .idle:
+                    Color.clear
+                case .started:
+                    ProgressView()
+                case .streaming:
+                    Canvas(opaque: true) { context, size in
+                        if let cgImage = streamManager.cgImage {
+                            let image = Image(decorative: cgImage, scale: 1.0)
+                                .interpolation(.none)
+                            context.draw(image, in: CGRect(origin: .zero, size: size))
                         }
-                    case .error(let message):
-                        Text("Error: \(message)")
-                            .font(.title)
-                            .foregroundColor(.red)
                     }
+                    .aspectRatio(streamManager.aspectRatio, contentMode: .fit)
+                case .error(let message):
+                    Text("Error: \(message)")
+                        .font(.headline)
+                        .foregroundColor(.red)
+                        .padding()
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                HStack {
-                    TextField("Base URL", text: $baseURL)
-                        .textFieldStyle(RoundedBorderTextFieldStyle())
-                    Button(action: {
-                        if streamManager.isStreaming {
-                            streamManager.stopStreaming()
-                        } else if let url = URL(string: baseURL) {
-                            streamManager.startStreaming(from: url)
-                        }
-                    }) {
-                        // Dynamically change the icon based on state
-                        Image(systemName: streamManager.isStreaming ? "stop.fill" : "play.fill")
-                            .font(.title2)
-                            .fontWeight(.bold)
-                    }
-                    .buttonBorderShape(.circle)
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-                    
-                }
-                .padding()
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            HStack {
+                TextField("Host", text: $host)
+                    .textFieldStyle(RoundedBorderTextFieldStyle())
+                Button(action: {
+                    if streamManager.streaming {
+                        streamManager.stopStreaming()
+                    } else if let url = URL(string: "http://\(host):8881") {
+                        streamManager.startStreaming(from: url)
+                    }
+                }) {
+                    // Dynamically change the icon based on state
+                    Image(systemName: streamManager.streaming ? "stop.fill" : "play.fill")
+                        .font(.title2)
+                        .fontWeight(.bold)
+                }
+                .buttonBorderShape(.circle)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                
+            }
+            .padding()
         }
-        .edgesIgnoringSafeArea(.all)
-//        .onAppear {
-//            if let url = URL(string: baseURL) {
-//                print("started")
-//                streamManager.startStreaming(from: url)
-//            }
-//        }
+        .background(.black)
     }
 }
 
