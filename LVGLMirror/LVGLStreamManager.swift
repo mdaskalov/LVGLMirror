@@ -37,12 +37,11 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
     private var streamingTask: URLSessionDataTask?
     
     private var backBuffer = vImage_Buffer()
-    private var pixelBuffer: vImage.PixelBuffer<vImage.Interleaved8x2>?
-    private lazy var format = vImage_CGImageFormat(
-        bitsPerComponent: 5,  // RGB565: 5 bits for R, 6 for G, 5 for B
-        bitsPerPixel: 16,
+    private var format = vImage_CGImageFormat(
+        bitsPerComponent: 8,
+        bitsPerPixel: 24,
         colorSpace: Unmanaged.passRetained(CGColorSpaceCreateDeviceRGB()),
-        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue | CGImageByteOrderInfo.order16Little.rawValue),
+        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
         version: 0,
         decode: nil,
         renderingIntent: .defaultIntent
@@ -68,17 +67,10 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
         guard let wRange = Range(match.range(at: 1), in: html), let hRange = Range(match.range(at: 2), in: html) else { return }
         if let w = Int(html[wRange]), let h = Int(html[hRange]) {
             // Allocate back buffer using vImage's alignment-aware allocation
-            print("screen size: \(w)x\(h)")
             aspectRatio = CGFloat(w) / CGFloat(h)
-            
-            pixelBuffer = vImage.PixelBuffer<vImage.Interleaved8x2>(
-                width: w,
-                height: h
-            )
-            
-            //vImageBuffer_Init(&backBuffer, vImagePixelCount(h), vImagePixelCount(w), 24, vImage_Flags(kvImageNoFlags))
-            // Zero out the buffer initially
-            //memset(backBuffer.data, 0, backBuffer.rowBytes * Int(backBuffer.height))
+            print("screen size: \(w)x\(h) aspectRatio: \(aspectRatio)")
+            vImageBuffer_Init(&backBuffer, vImagePixelCount(h), vImagePixelCount(w), 24, vImage_Flags(kvImageNoFlags))
+            memset(backBuffer.data, 0, backBuffer.rowBytes * Int(backBuffer.height))
         }
     }
     
