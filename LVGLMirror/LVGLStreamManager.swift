@@ -67,9 +67,9 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
             // Allocate back buffer using vImage's alignment-aware allocation
             aspectRatio = CGFloat(w) / CGFloat(h)
             print("screen size: \(w)x\(h) aspectRatio: \(aspectRatio)")
-            pixelBuffer = vImage.PixelBuffer<vImage.Interleaved8x3>(width: w, height: h)
+            pixelBuffer = vImage.PixelBuffer<vImage.Interleaved8x3>(width: w, height: h)           
             pixelBuffer?.withUnsafeVImageBuffer { buf in
-                _ = memset(buf.data, 0, buf.rowBytes * Int(buf.height))
+                _ = memset(buf.data, 0, buf.rowBytes * h)
             }
         }
     }
@@ -77,34 +77,30 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
     private func process(jsonPayload: Data) {
         guard let update = try? JSONDecoder().decode(LVGLUpdate.self, from: jsonPayload),
               let b64 = update.b64,
-              let rawImgData = Data(base64Encoded: b64),
               let pixelBuffer else { return }
 
         let width  = update.x2 - update.x1 + 1
         let height = update.y2 - update.y1 + 1
+        let ROI = CGRect(x: update.x1, y: update.y1, width: width, height: height)
         
         guard width > 0, height > 0 else { return }
 
-        rawImgData.withUnsafeBytes { rawPtr in
-            var srcBuffer = vImage_Buffer(
-                data: UnsafeMutableRawPointer(mutating: rawPtr.baseAddress),
+        Data(base64Encoded: b64)?.withUnsafeBytes { dataPtr in
+            guard let baseAddress = dataPtr.baseAddress else { return }
+            var src = vImage_Buffer(
+                data: UnsafeMutableRawPointer(mutating: baseAddress),
                 height: vImagePixelCount(height),
                 width: vImagePixelCount(width),
-                rowBytes: width * 2
+                rowBytes: width * 2 // RGB565 is 2 bytes per pixel
             )
-            
-            pixelBuffer.withUnsafeVImageBuffer { vImageBuffer in
-                let byteOffset = update.y1 * vImageBuffer.rowBytes + update.x1 * 3
-                var destSubBuffer = vImage_Buffer(
-                    data: vImageBuffer.data.advanced(by: byteOffset),
-                    height: vImagePixelCount(height),
-                    width: vImagePixelCount(width),
-                    rowBytes: vImageBuffer.rowBytes
-                )
-                vImageConvert_RGB565toRGB888(&srcBuffer, &destSubBuffer, vImage_Flags(kvImageNoFlags))
+            pixelBuffer.withUnsafeRegionOfInterest(ROI) { roiBuffer in
+                roiBuffer.withUnsafeVImageBuffer { dst in
+                    var mutableDst = dst
+                    vImageConvert_RGB565toRGB888(&src, &mutableDst, vImage_Flags(kvImageNoFlags))
+                }
             }
+            cgImage = pixelBuffer.makeCGImage(cgImageFormat: format)
         }
-        cgImage = pixelBuffer.makeCGImage(cgImageFormat: format)
     }
     
     func startStreaming(from url: URL) {
