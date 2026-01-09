@@ -36,16 +36,18 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
     private var streamBuffer = Data()
     private var streamingTask: URLSessionDataTask?
     
-    private var backBuffer = vImage_Buffer()
-    private var format = vImage_CGImageFormat(
-        bitsPerComponent: 8,
-        bitsPerPixel: 24,
-        colorSpace: Unmanaged.passRetained(CGColorSpaceCreateDeviceRGB()),
-        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
-        version: 0,
-        decode: nil,
-        renderingIntent: .defaultIntent
-    )
+    private var pixelBuffer: vImage.PixelBuffer<vImage.Interleaved8x3>?
+    private lazy var format: vImage_CGImageFormat = {
+        vImage_CGImageFormat(
+            bitsPerComponent: 8,
+            bitsPerPixel: 24,
+            colorSpace: Unmanaged.passRetained(CGColorSpaceCreateDeviceRGB()),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+            version: 0,
+            decode: nil,
+            renderingIntent: .defaultIntent
+        )
+    }()
     
     private let processingQueue = DispatchQueue(label: "lvgl.process", qos: .userInitiated)
     private let dataPrefix = "\r\nevent:lvgl\r\ndata:".data(using: .utf8)!
@@ -57,10 +59,6 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
         let b64: String?
     }
     
-    deinit {
-        backBuffer.data.deallocate()
-    }
- 
     private func parseLVGLPage(from html: String) {
         guard let regex = try? NSRegularExpression(pattern: lvglPagePattern),
               let match = regex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)) else { return }
@@ -69,22 +67,24 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
             // Allocate back buffer using vImage's alignment-aware allocation
             aspectRatio = CGFloat(w) / CGFloat(h)
             print("screen size: \(w)x\(h) aspectRatio: \(aspectRatio)")
-            vImageBuffer_Init(&backBuffer, vImagePixelCount(h), vImagePixelCount(w), 24, vImage_Flags(kvImageNoFlags))
-            memset(backBuffer.data, 0, backBuffer.rowBytes * Int(backBuffer.height))
+            pixelBuffer = vImage.PixelBuffer<vImage.Interleaved8x3>(width: w, height: h)
+            pixelBuffer?.withUnsafeVImageBuffer { buf in
+                _ = memset(buf.data, 0, buf.rowBytes * Int(buf.height))
+            }
         }
     }
     
     private func process(jsonPayload: Data) {
         guard let update = try? JSONDecoder().decode(LVGLUpdate.self, from: jsonPayload),
               let b64 = update.b64,
-              let rawImgData = Data(base64Encoded: b64) else { return }
+              let rawImgData = Data(base64Encoded: b64),
+              let pixelBuffer else { return }
 
         let width  = update.x2 - update.x1 + 1
         let height = update.y2 - update.y1 + 1
         
         guard width > 0, height > 0 else { return }
 
-        // 1. Prepare Source Buffer (RGB565 from LVGL)
         rawImgData.withUnsafeBytes { rawPtr in
             var srcBuffer = vImage_Buffer(
                 data: UnsafeMutableRawPointer(mutating: rawPtr.baseAddress),
@@ -92,21 +92,19 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
                 width: vImagePixelCount(width),
                 rowBytes: width * 2
             )
-
-            // 2. Prepare Destination Sub-Buffer (Pointing into our main backBuffer)
-            let byteOffset = update.y1 * backBuffer.rowBytes + update.x1 * 3
-            var destSubBuffer = vImage_Buffer(
-                data: backBuffer.data.advanced(by: byteOffset),
-                height: vImagePixelCount(height),
-                width: vImagePixelCount(width),
-                rowBytes: backBuffer.rowBytes
-            )
-
-            // 3. Hardware Accelerated Conversion
-            vImageConvert_RGB565toRGB888(&srcBuffer, &destSubBuffer, vImage_Flags(kvImageNoFlags))
             
-            cgImage = try? backBuffer.createCGImage(format: format)
+            pixelBuffer.withUnsafeVImageBuffer { vImageBuffer in
+                let byteOffset = update.y1 * vImageBuffer.rowBytes + update.x1 * 3
+                var destSubBuffer = vImage_Buffer(
+                    data: vImageBuffer.data.advanced(by: byteOffset),
+                    height: vImagePixelCount(height),
+                    width: vImagePixelCount(width),
+                    rowBytes: vImageBuffer.rowBytes
+                )
+                vImageConvert_RGB565toRGB888(&srcBuffer, &destSubBuffer, vImage_Flags(kvImageNoFlags))
+            }
         }
+        cgImage = pixelBuffer.makeCGImage(cgImageFormat: format)
     }
     
     func startStreaming(from url: URL) {
@@ -139,10 +137,8 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
                     }
                     let jsonPayload = streamBuffer.subdata(in: searchStart..<endOfLineRange.lowerBound)
                     streamBuffer.removeSubrange(0..<endOfLineRange.upperBound)
-                    if backBuffer.data != nil {
-                        DispatchQueue.main.async {
-                            self.process(jsonPayload: jsonPayload)
-                        }
+                    DispatchQueue.main.async {
+                        self.process(jsonPayload: jsonPayload)
                     }
                 }
             }

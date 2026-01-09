@@ -58,7 +58,6 @@ struct LVGLView: View {
             }
             .padding()
         }
-        .background(.black)
     }
 }
 
