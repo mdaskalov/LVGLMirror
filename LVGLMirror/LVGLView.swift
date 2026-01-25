@@ -9,7 +9,7 @@ import SwiftUI
 
 struct LVGLView: View {
     @StateObject var streamManager = LVGLStreamManager()
-    @State var host: String = "office-th"
+    @State var host: String = "esp32-s3-lcd"
     
     var body: some View {
         VStack {
@@ -20,14 +20,14 @@ struct LVGLView: View {
                 case .started:
                     ProgressView()
                 case .streaming:
-                    Canvas(opaque: true) { context, size in
-                        if let cgImage = streamManager.cgImage {
-                            let image = Image(decorative: cgImage, scale: 1.0)
-                                .interpolation(.none)
-                            context.draw(image, in: CGRect(origin: .zero, size: size))
-                        }
+                    if let cgImage = streamManager.cgImage {
+                       Image(decorative: cgImage, scale: 1.0)
+                            .resizable()
+                            .interpolation(.none)
+                            .aspectRatio(streamManager.aspectRatio, contentMode: .fit)
+                    } else {
+                        Color.clear
                     }
-                    .aspectRatio(streamManager.aspectRatio, contentMode: .fit)
                 case .error(let message):
                     Text("Error: \(message)")
                         .font(.headline)
