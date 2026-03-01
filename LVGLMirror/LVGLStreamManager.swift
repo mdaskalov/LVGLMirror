@@ -9,55 +9,32 @@ import SwiftUI
 import Combine
 import Accelerate
 
-enum LVGLStreamState {
+enum LVGLStreamState: Equatable {
     case idle
     case started
     case streaming
     case error(String)
 }
 
-struct LVGLPacketHeader {
-    static let size: Int = 14 // 4(LVGL) + 2(len) + 2(x) + 2(y) + 2(w) + 2(h)
-    static let magicValue: UInt32 = 0x4C56474C // LVGL
-    static let magicData: Data = {
-        var magic = magicValue
-        return withUnsafeBytes(of: &magic) { Data($0) }
-    }()
-    
-    let region: CGRect
-    let dataRange: Range<Data.Index>
-
-    init?(data: Data) {
-        guard data.count >= LVGLPacketHeader.size else { return nil }
-        let magic = data.prefix(4).withUnsafeBytes { $0.load(as: UInt32.self) }
-        guard magic == LVGLPacketHeader.magicValue else {
-            print("invalid magic: \(String(format: "0x%08X", magic))")
-            return nil
-        }
-        let x = Int(data.subdata(in: 4..<6).withUnsafeBytes { $0.load(as: UInt16.self) })
-        let y = Int(data.subdata(in: 6..<8).withUnsafeBytes { $0.load(as: UInt16.self) })
-        let w = Int(data.subdata(in: 8..<10).withUnsafeBytes { $0.load(as: UInt16.self) })
-        let h = Int(data.subdata(in: 10..<12).withUnsafeBytes { $0.load(as: UInt16.self) })
-        let len = w * h * 2
-        self.region = CGRect(x: x, y: y, width: w, height: h)
-        self.dataRange = 0..<Int(len) + LVGLPacketHeader.size
-    }
-}
-
 class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
+    static let magicValue: UInt16 = 0x564C // LV
+    static let headerBytes: Int = 10 // 2(LV) + 2(x) + 2(y) + 2(w) + 2(h)
+
     @Published var streamState: LVGLStreamState = .idle
     @Published var cgImage: CGImage?
     
     var aspectRatio: CGFloat = 1.0
     
-    var streaming: Bool {
-        if case .streaming = streamState { return true }
-        return false
+    var streaming: Bool { switch streamState {
+        case .started, .streaming: true
+        default : false
+        }
     }
     
-    private var streamBuffer = Data()
     private var streamingTask: URLSessionDataTask?
-    
+    private var readBuffer = Data()
+    private var updateBuffer = Data()
+
     private var pixelBuffer: vImage.PixelBuffer<vImage.Interleaved8x3>?
     private var format: vImage_CGImageFormat = {
         vImage_CGImageFormat(
@@ -71,6 +48,63 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
         )
     }()
     
+    func parseHeader(data: Data) -> CGRect? {
+        let magic = data.prefix(2).withUnsafeBytes { $0.load(as: UInt16.self) }
+        guard magic == LVGLStreamManager.magicValue else {
+            print("invalid magic: \(String(format: "0x%04X", magic))")
+            return nil
+        }
+        let x = Int(data.subdata(in: 2..<4).withUnsafeBytes { $0.load(as: UInt16.self) })
+        let y = Int(data.subdata(in: 4..<6).withUnsafeBytes { $0.load(as: UInt16.self) })
+        let w = Int(data.subdata(in: 6..<8).withUnsafeBytes { $0.load(as: UInt16.self) })
+        let h = Int(data.subdata(in: 8..<10).withUnsafeBytes { $0.load(as: UInt16.self) })
+        return CGRect(x: x, y: y, width: w, height: h)
+    }
+
+    private func decompress(data: Data, expectedPixels: Int) -> Int? {
+        updateBuffer = Data(capacity: expectedPixels * 2)
+        var pixelsWritten = 0
+
+        let result = data.withUnsafeBytes { ptr -> Int? in
+            guard let base = ptr.bindMemory(to: UInt16.self).baseAddress else { return nil }
+            let available = data.count / 2
+            var i = 0
+
+            while pixelsWritten < expectedPixels {
+                guard i < available else { return nil }
+                let header = base[i]; i += 1
+
+                if header & 0x8000 != 0 {
+                    // repeated block
+                    let count = Int(header & 0x7FFF) + 2
+                    guard i < available else { return nil }
+                    let value = base[i]; i += 1
+                    for _ in 0..<count {
+                        withUnsafeBytes(of: value) { updateBuffer.append(contentsOf: $0) }
+                        pixelsWritten += 1
+                    }
+                } else {
+                    // raw block
+                    let count = Int(header) + 1
+                    guard i + count <= available else { return nil }
+                    for j in 0..<count {
+                        withUnsafeBytes(of: base[i + j]) { updateBuffer.append(contentsOf: $0) }
+                        pixelsWritten += 1
+                    }
+                    i += count
+                }
+            }
+            return i * 2
+        }
+
+        guard let bytesConsumed = result else { return nil }
+        
+        let ratio = 1/Double(bytesConsumed) * Double(updateBuffer.count)
+        print("Compression ratio: \(String(format: "%.2f", ratio))")
+        
+        return bytesConsumed
+    }
+    
     private func process(region: CGRect, data: Data) {
         data.withUnsafeBytes { dataPtr in
             guard let baseAddress = dataPtr.baseAddress else { return }
@@ -78,7 +112,7 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
                 data: UnsafeMutableRawPointer(mutating: baseAddress),
                 height: vImagePixelCount(region.height),
                 width: vImagePixelCount(region.width),
-                rowBytes: Int(region.width) * 2 // RGB565 is 2 bytes per pixel
+                rowBytes: Int(region.width) * 2
             )
             pixelBuffer?.withUnsafeRegionOfInterest(region) { roiBuffer in
                 roiBuffer.withUnsafeVImageBuffer { dst in
@@ -86,14 +120,12 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
                     vImageConvert_RGB565toRGB888(&src, &mutableDst, vImage_Flags(kvImageNoFlags))
                 }
             }
-            // Push to main thread only for the final assignment
-            self.cgImage = pixelBuffer?.makeCGImage(cgImageFormat: format)
         }
     }
         
     func startStreaming(from url: URL) {
         streamingTask?.cancel()
-        streamBuffer.removeAll()
+        readBuffer.removeAll()
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 10
         let session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
@@ -112,6 +144,7 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
         if let response = response as? HTTPURLResponse, let screenSize = response.value(forHTTPHeaderField: "Screen-Size") {
             let parts = screenSize.split(separator: "x")
             if parts.count == 2, let w = Int(parts[0]), let h = Int(parts[1]) {
+                updateBuffer = Data(capacity: w * h * 2)
                 aspectRatio = CGFloat(w) / CGFloat(h)
                 print("Screen size: \(w)x\(h) aspectRatio: \(aspectRatio)")
                 pixelBuffer = vImage.PixelBuffer<vImage.Interleaved8x3>(width: w, height: h)
@@ -124,33 +157,30 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
         }
         completionHandler(.allow)
     }
-
+    
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        streamBuffer.append(data)
+        readBuffer.append(data)
         guard case .streaming = streamState else { return }
         
-        while streamBuffer.count >= LVGLPacketHeader.size {
-            let packetHeader = LVGLPacketHeader(data: streamBuffer)
-            if let header = packetHeader, streamBuffer.count >= header.dataRange.upperBound {
-                let payloadRange = LVGLPacketHeader.size..<header.dataRange.upperBound
-                let pixelData = streamBuffer.subdata(in: payloadRange)
-                streamBuffer.removeSubrange(header.dataRange)
-                DispatchQueue.main.async {
-                    self.process(region: header.region, data: pixelData)
-                }
-            } else if packetHeader == nil {
-                if let nextMagicRange = streamBuffer.range(of: LVGLPacketHeader.magicData) {
-                    print("Out of sync: discarding \(nextMagicRange.lowerBound) bytes.")
-                    streamBuffer.removeSubrange(0..<nextMagicRange.lowerBound)
-                    continue // try parsing at the new start position
-                } else {
-                    let bytesToKeep = min(streamBuffer.count, 3) // keep the last 3 bytes, in case "LVGL" was split across packets
-                    print("Out of sync: dropping \(streamBuffer.count - bytesToKeep) bytes.")
-                    streamBuffer.removeSubrange(0..<(streamBuffer.count - bytesToKeep))
-                    break
-                }
-            } else {
-                break
+        while readBuffer.count >= LVGLStreamManager.headerBytes {
+            guard let header = parseHeader(data: readBuffer) else {
+                streamState = .error("Out of sync")
+                return
+            }
+
+            let expectedPixels = Int(header.width * header.height)
+            let compressedSlice = readBuffer.dropFirst(LVGLStreamManager.headerBytes)
+
+            guard let bytesConsumed = decompress(data: compressedSlice, expectedPixels: expectedPixels) else {
+                break // not enough data yet, wait for more
+            }
+
+            // Consume header + compressed bytes
+            readBuffer.removeSubrange(0..<(LVGLStreamManager.headerBytes + bytesConsumed))
+
+            self.process(region: header, data: updateBuffer)
+            DispatchQueue.main.async {
+                self.cgImage = self.pixelBuffer?.makeCGImage(cgImageFormat: self.format)
             }
         }
     }

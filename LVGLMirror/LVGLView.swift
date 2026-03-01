@@ -9,7 +9,7 @@ import SwiftUI
 
 struct LVGLView: View {
     @StateObject var streamManager = LVGLStreamManager()
-    @State var host: String = "esp32-s3-lcd"
+    @State var host: String = "office-th"
     
     var body: some View {
         VStack {
