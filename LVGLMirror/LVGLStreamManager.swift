@@ -33,6 +33,8 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
     
     private var streamingTask: URLSessionDataTask?
     private var readBuffer = Data()
+    
+    private var updateRegion: CGRect?
     private var updateBuffer = Data()
 
     private var pixelBuffer: vImage.PixelBuffer<vImage.Interleaved8x3>?
@@ -144,7 +146,6 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
         if let response = response as? HTTPURLResponse, let screenSize = response.value(forHTTPHeaderField: "Screen-Size") {
             let parts = screenSize.split(separator: "x")
             if parts.count == 2, let w = Int(parts[0]), let h = Int(parts[1]) {
-                updateBuffer = Data(capacity: w * h * 2)
                 aspectRatio = CGFloat(w) / CGFloat(h)
                 print("Screen size: \(w)x\(h) aspectRatio: \(aspectRatio)")
                 pixelBuffer = vImage.PixelBuffer<vImage.Interleaved8x3>(width: w, height: h)
@@ -161,27 +162,21 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         readBuffer.append(data)
         guard case .streaming = streamState else { return }
-        
-        while readBuffer.count >= LVGLStreamManager.headerBytes {
-            guard let header = parseHeader(data: readBuffer) else {
-                streamState = .error("Out of sync")
-                return
+        if let region = updateRegion {
+            let expectedPixels = Int(region.width * region.height)
+            if let bytesConsumed = decompress(data: readBuffer, expectedPixels: expectedPixels) {
+                updateRegion = nil
+                readBuffer.removeSubrange(0..<bytesConsumed)
+                self.process(region: region, data: updateBuffer)
+                DispatchQueue.main.async {
+                    self.cgImage = self.pixelBuffer?.makeCGImage(cgImageFormat: self.format)
+                }
             }
-
-            let expectedPixels = Int(header.width * header.height)
-            let compressedSlice = readBuffer.dropFirst(LVGLStreamManager.headerBytes)
-
-            guard let bytesConsumed = decompress(data: compressedSlice, expectedPixels: expectedPixels) else {
-                break // not enough data yet, wait for more
-            }
-
-            // Consume header + compressed bytes
-            readBuffer.removeSubrange(0..<(LVGLStreamManager.headerBytes + bytesConsumed))
-
-            self.process(region: header, data: updateBuffer)
-            DispatchQueue.main.async {
-                self.cgImage = self.pixelBuffer?.makeCGImage(cgImageFormat: self.format)
-            }
+        } else if readBuffer.count >= LVGLStreamManager.headerBytes {
+            guard let region = parseHeader(data: readBuffer) else { streamState = .error("Out of sync"); return }
+            updateRegion = region
+            updateBuffer = Data(capacity: Int(region.width * region.height) * 2)
+            readBuffer.removeSubrange(0..<LVGLStreamManager.headerBytes)
         }
     }
 
