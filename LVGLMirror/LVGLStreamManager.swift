@@ -50,76 +50,83 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
         )
     }()
     
-    func parseHeader(data: Data) -> CGRect? {
-        let magic = data.prefix(2).withUnsafeBytes { $0.load(as: UInt16.self) }
+    func parseHeader() -> CGRect? {
+        let magic = readBuffer.prefix(2).withUnsafeBytes { $0.load(as: UInt16.self) }
         guard magic == LVGLStreamManager.magicValue else {
             print("invalid magic: \(String(format: "0x%04X", magic))")
             return nil
         }
-        let x = Int(data.subdata(in: 2..<4).withUnsafeBytes { $0.load(as: UInt16.self) })
-        let y = Int(data.subdata(in: 4..<6).withUnsafeBytes { $0.load(as: UInt16.self) })
-        let w = Int(data.subdata(in: 6..<8).withUnsafeBytes { $0.load(as: UInt16.self) })
-        let h = Int(data.subdata(in: 8..<10).withUnsafeBytes { $0.load(as: UInt16.self) })
+        let x = Int(readBuffer.subdata(in: 2..<4).withUnsafeBytes { $0.load(as: UInt16.self) })
+        let y = Int(readBuffer.subdata(in: 4..<6).withUnsafeBytes { $0.load(as: UInt16.self) })
+        let w = Int(readBuffer.subdata(in: 6..<8).withUnsafeBytes { $0.load(as: UInt16.self) })
+        let h = Int(readBuffer.subdata(in: 8..<10).withUnsafeBytes { $0.load(as: UInt16.self) })
         return CGRect(x: x, y: y, width: w, height: h)
     }
 
-    private func decompress(data: Data, expectedPixels: Int) -> Int? {
-        updateBuffer = Data(capacity: expectedPixels * 2)
+    private func decompress() -> Int? {
+        let expectedPixels = updateBuffer.count / 2
         var pixelsWritten = 0
-
-        let result = data.withUnsafeBytes { ptr -> Int? in
+        let result = readBuffer.withUnsafeBytes { ptr -> Int? in
             guard let base = ptr.bindMemory(to: UInt16.self).baseAddress else { return nil }
-            let available = data.count / 2
+            let available = readBuffer.count / 2
             var i = 0
 
-            while pixelsWritten < expectedPixels {
-                guard i < available else { return nil }
-                let header = base[i]; i += 1
+            return updateBuffer.withUnsafeMutableBytes { bufPtr -> Int? in
+                guard let bufBase = bufPtr.bindMemory(to: UInt16.self).baseAddress else { return nil }
 
-                if header & 0x8000 != 0 {
-                    // repeated block
-                    let count = Int(header & 0x7FFF) + 2
+                while pixelsWritten < expectedPixels {
                     guard i < available else { return nil }
-                    let value = base[i]; i += 1
-                    for _ in 0..<count {
-                        withUnsafeBytes(of: value) { updateBuffer.append(contentsOf: $0) }
-                        pixelsWritten += 1
+                    let header = base[i]; i += 1
+
+                    if header & 0x8000 != 0 {
+                        // repeated block
+                        let count = Int(header & 0x7FFF) + 2
+                        guard i < available else { return nil }
+                        let value = base[i]; i += 1
+                        guard pixelsWritten + count <= expectedPixels else { return nil }
+                        for _ in 0..<count {
+                            bufBase[pixelsWritten] = value
+                            pixelsWritten += 1
+                        }
+                    } else {
+                        // raw block
+                        let count = Int(header) + 1
+                        guard i + count <= available else { return nil }
+                        guard pixelsWritten + count <= expectedPixels else { return nil }
+                        for j in 0..<count {
+                            bufBase[pixelsWritten] = base[i + j]
+                            pixelsWritten += 1
+                        }
+                        i += count
                     }
-                } else {
-                    // raw block
-                    let count = Int(header) + 1
-                    guard i + count <= available else { return nil }
-                    for j in 0..<count {
-                        withUnsafeBytes(of: base[i + j]) { updateBuffer.append(contentsOf: $0) }
-                        pixelsWritten += 1
-                    }
-                    i += count
                 }
+                return i * 2
             }
-            return i * 2
         }
 
         guard let bytesConsumed = result else { return nil }
-        
-        let ratio = 1/Double(bytesConsumed) * Double(updateBuffer.count)
+
+        let ratio = 1 / Double(bytesConsumed) * Double(pixelsWritten * 2)
         print("Compression ratio: \(String(format: "%.2f", ratio))")
-        
+
         return bytesConsumed
     }
     
-    private func process(region: CGRect, data: Data) {
-        data.withUnsafeBytes { dataPtr in
-            guard let baseAddress = dataPtr.baseAddress else { return }
-            var src = vImage_Buffer(
-                data: UnsafeMutableRawPointer(mutating: baseAddress),
-                height: vImagePixelCount(region.height),
-                width: vImagePixelCount(region.width),
-                rowBytes: Int(region.width) * 2
-            )
-            pixelBuffer?.withUnsafeRegionOfInterest(region) { roiBuffer in
-                roiBuffer.withUnsafeVImageBuffer { dst in
-                    var mutableDst = dst
-                    vImageConvert_RGB565toRGB888(&src, &mutableDst, vImage_Flags(kvImageNoFlags))
+    private func process() {
+        if let region = updateRegion {
+            updateBuffer.withUnsafeBytes { dataPtr in
+                guard let baseAddress = dataPtr.baseAddress else { return }
+                var src = vImage_Buffer(
+                    data: UnsafeMutableRawPointer(mutating: baseAddress),
+                    height: vImagePixelCount(region.height),
+                    width: vImagePixelCount(region.width),
+                    rowBytes: Int(region.width) * 2
+                )
+                pixelBuffer?.withUnsafeRegionOfInterest(region) { roiBuffer in
+                    roiBuffer.withUnsafeVImageBuffer { dst in
+                        var mutableDst = dst
+                        vImageConvert_RGB565toRGB888(&src, &mutableDst, vImage_Flags(kvImageNoFlags))
+                    }
                 }
             }
         }
@@ -128,6 +135,8 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
     func startStreaming(from url: URL) {
         streamingTask?.cancel()
         readBuffer.removeAll()
+        updateRegion = nil
+        updateBuffer.removeAll()
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 10
         let session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
@@ -162,20 +171,19 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         readBuffer.append(data)
         guard case .streaming = streamState else { return }
-        if let region = updateRegion {
-            let expectedPixels = Int(region.width * region.height)
-            if let bytesConsumed = decompress(data: readBuffer, expectedPixels: expectedPixels) {
+        if updateRegion != nil {
+            if let bytesConsumed = decompress() {
+                self.process()
                 updateRegion = nil
                 readBuffer.removeSubrange(0..<bytesConsumed)
-                self.process(region: region, data: updateBuffer)
                 DispatchQueue.main.async {
                     self.cgImage = self.pixelBuffer?.makeCGImage(cgImageFormat: self.format)
                 }
             }
         } else if readBuffer.count >= LVGLStreamManager.headerBytes {
-            guard let region = parseHeader(data: readBuffer) else { streamState = .error("Out of sync"); return }
+            guard let region = parseHeader() else { streamState = .error("Out of sync"); return }
             updateRegion = region
-            updateBuffer = Data(capacity: Int(region.width * region.height) * 2)
+            updateBuffer = Data(count: Int(region.width * region.height) * 2)
             readBuffer.removeSubrange(0..<LVGLStreamManager.headerBytes)
         }
     }
