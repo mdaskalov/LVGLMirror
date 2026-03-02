@@ -21,10 +21,9 @@ struct LVGLView: View {
                     ProgressView()
                 case .streaming:
                     if let cgImage = streamManager.cgImage {
-                       Image(decorative: cgImage, scale: 1.0)
+                        Image(decorative: cgImage, scale: 1.0)
                             .resizable()
-                            .interpolation(.none)
-                            .aspectRatio(streamManager.aspectRatio, contentMode: .fit)
+                            .aspectRatio(CGFloat(cgImage.width / cgImage.height), contentMode: .fit)
                     } else {
                         Color.clear
                     }
@@ -37,17 +36,20 @@ struct LVGLView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             HStack {
+                let streaming = switch streamManager.streamState {
+                case .started, .streaming: true
+                default: false
+                }
                 TextField("Host", text: $host)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
                 Button(action: {
-                    if streamManager.streaming {
+                    if streaming {
                         streamManager.stopStreaming()
                     } else if let url = URL(string: "http://\(host):8881") {
                         streamManager.startStreaming(from: url)
                     }
                 }) {
-                    // Dynamically change the icon based on state
-                    Image(systemName: streamManager.streaming ? "stop.fill" : "play.fill")
+                    Image(systemName: streaming ? "stop.fill" : "play.fill")
                         .font(.title2)
                         .fontWeight(.bold)
                 }
