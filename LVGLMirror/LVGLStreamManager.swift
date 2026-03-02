@@ -60,7 +60,7 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
                     let src = srcBase.advanced(by: readOffset)
                     let header = src[0]
                     let isRun = (header & 0x8000) != 0
-                    let count = isRun ? Int(header & 0x7FFF) + 2 : Int(header) + 1
+                    let count = Int(header & 0x7FFF) + (isRun ? 2 : 1)
                     guard readOffset + 1 + (isRun ? 1 : count) <= available, writeOffset + count <= expectedPixels else { break }
                     let dst = dstBase.advanced(by: writeOffset)
                     if isRun {
@@ -77,7 +77,7 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
         }
     }
     
-    func processUpdate(region: CGRect) {
+    func update(region: CGRect) {
         writeBuffer.withUnsafeMutableBufferPointer { arrayPtr in
             imageBuffer?.withUnsafeRegionOfInterest(region) { roiBuffer in
                 roiBuffer.withUnsafeVImageBuffer { dst in
@@ -105,7 +105,6 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
                 renderingIntent: .defaultIntent
             ))
         }
-        readBuffer.removeFirst(readOffset * 2)
     }
     
     func startStreaming(from url: URL) {
@@ -146,15 +145,18 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         guard case .streaming = streamState else { return }
         readBuffer.append(data)
-        if let region = updateRegion {
-            if !decompress() {
-                streamState = .error("Decompression failed.")
-            } else if writeOffset >= expectedPixels {
-                processUpdate(region: region)
-                updateRegion = nil // wait for next header
+        while true {
+            if updateRegion == nil {
+                guard parseHeader() else { streamState = .error("Out of sync."); return }
+                guard updateRegion != nil else { break } // need more data for header
             }
-        } else if !parseHeader() {
-            streamState = .error("Out of sync.")
+            
+            guard decompress() else { streamState = .error("Decompression failed."); return }
+            guard writeOffset >= expectedPixels else { break } // need more data for frame
+            
+            update(region: updateRegion!)
+            readBuffer.removeFirst(readOffset * 2)
+            updateRegion = nil
         }
     }
 
