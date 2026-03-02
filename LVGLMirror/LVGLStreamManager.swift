@@ -32,6 +32,17 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
     private var writeBuffer: ContiguousArray<UInt16> = []
 
     private var imageBuffer: vImage.PixelBuffer<vImage.Interleaved8x3>?
+    
+    private let colorSpace = CGColorSpaceCreateDeviceRGB()
+    private lazy var cgImageFormat = vImage_CGImageFormat(
+        bitsPerComponent: 8,
+        bitsPerPixel: 24,
+        colorSpace: Unmanaged.passUnretained(colorSpace),
+        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+        version: 0,
+        decode: nil,
+        renderingIntent: .defaultIntent
+    )
 
     func parseHeader() -> Bool {
         let magicValue: UInt16 = 0x564C // LV
@@ -45,7 +56,7 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
             expectedPixels = w * h
             readOffset = 0
             writeOffset = 0
-            readBuffer.removeFirst(headerBytes)
+            readBuffer.removeSubrange(0..<headerBytes)
             return true
         }
     }
@@ -95,20 +106,12 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
             }
         }
         DispatchQueue.main.async {
-            self.cgImage = self.imageBuffer?.makeCGImage(cgImageFormat: vImage_CGImageFormat(
-                bitsPerComponent: 8,
-                bitsPerPixel: 24,
-                colorSpace: Unmanaged.passUnretained(CGColorSpaceCreateDeviceRGB()),
-                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
-                version: 0,
-                decode: nil,
-                renderingIntent: .defaultIntent
-            ))
+            self.cgImage = self.imageBuffer?.makeCGImage(cgImageFormat: self.cgImageFormat)
         }
     }
     
     func startStreaming(from url: URL) {
-        streamingTask?.cancel()
+        stopStreaming()  // cancel + invalidate old session
         readBuffer.removeAll()
         updateRegion = nil
         let config = URLSessionConfiguration.default
@@ -121,6 +124,7 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
 
     func stopStreaming() {
         streamingTask?.cancel()
+        streamingTask = nil
     }
        
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
@@ -155,18 +159,17 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
             guard writeOffset >= expectedPixels else { break } // need more data for frame
             
             update(region: updateRegion!)
-            readBuffer.removeFirst(readOffset * 2)
+            readBuffer.removeSubrange(0..<(readOffset * 2))
             updateRegion = nil
         }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        session.invalidateAndCancel()  // release delegate reference
         if let err = error as NSError? {
             streamState = err.code == NSURLErrorCancelled ? .idle : .error(err.localizedDescription)
-        }
-        else {
+        } else {
             if case .streaming = streamState { streamState = .idle }
-            streamingTask?.cancel()
         }
     }
 }
