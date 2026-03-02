@@ -19,7 +19,8 @@ enum LVGLStreamState: Equatable {
 class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
     @Published var streamState: LVGLStreamState = .idle
     @Published var cgImage: CGImage?
-    
+    @Published var aspectRatio: CGFloat = 1.0
+
     private var streamingTask: URLSessionDataTask?
     
     private var readOffset = 0
@@ -128,6 +129,7 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
         if let response = response as? HTTPURLResponse, let screenSize = response.value(forHTTPHeaderField: "Screen-Size") {
             let parts = screenSize.split(separator: "x")
             if parts.count == 2, let w = Int(parts[0]), let h = Int(parts[1]) {
+                aspectRatio = CGFloat(w) / CGFloat(h)
                 writeBuffer = ContiguousArray<UInt16>(repeating: 0, count: w * h)
                 imageBuffer = vImage.PixelBuffer<vImage.Interleaved8x3>(width: w, height: h)
                 imageBuffer?.withUnsafeVImageBuffer { buf in

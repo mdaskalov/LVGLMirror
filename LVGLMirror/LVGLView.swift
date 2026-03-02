@@ -23,7 +23,7 @@ struct LVGLView: View {
                     if let cgImage = streamManager.cgImage {
                         Image(decorative: cgImage, scale: 1.0)
                             .resizable()
-                            .aspectRatio(CGFloat(cgImage.width / cgImage.height), contentMode: .fit)
+                            .aspectRatio(streamManager.aspectRatio, contentMode: .fit)
                     } else {
                         Color.clear
                     }
