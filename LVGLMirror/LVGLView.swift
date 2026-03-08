@@ -24,6 +24,25 @@ struct LVGLView: View {
                         Image(decorative: cgImage, scale: 1.0)
                             .resizable()
                             .aspectRatio(streamManager.aspectRatio, contentMode: .fit)
+                            .overlay(
+                                GeometryReader { g in
+                                    Color.clear
+                                        .contentShape(Rectangle())
+                                        .gesture(
+                                            DragGesture(minimumDistance: 0)
+                                                .onChanged { value in
+                                                    let loc = value.location
+                                                    let x = Int((loc.x / g.size.width) * CGFloat(cgImage.width))
+                                                    let y = Int((loc.y / g.size.height) * CGFloat(cgImage.height))
+                                                    
+                                                    let clampedX = min(max(x, 0), cgImage.width - 1)
+                                                    let clampedY = min(max(y, 0), cgImage.height - 1)
+                                                    
+                                                    sendTouchEvent(atX: clampedX, y: clampedY)
+                                                }
+                                        )
+                                }
+                            )
                     } else {
                         Color.clear
                     }
@@ -60,6 +79,19 @@ struct LVGLView: View {
             }
             .padding()
         }
+    }
+    
+    private func sendTouchEvent(atX x: Int, y: Int) {
+        guard let url = URL(string: "http://\(host)/lvgl_touch") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.httpBody = "x=\(x)&y=\(y)".data(using: .utf8)
+        URLSession.shared.dataTask(with: request) { _, _, error in
+            if let error = error {
+                print("Touch event error: \(error)")
+            }
+        }.resume()
     }
 }
 
