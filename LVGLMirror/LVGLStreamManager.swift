@@ -22,19 +22,19 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
     @Published var aspectRatio: CGFloat = 1.0
 
     private var streamingTask: URLSessionDataTask?
-    
+
     private var (x,y,w,h) = (0,0,0,0)
     private var headerParsed = false
 
     private var readOffset = 0
     private var readBuffer = Data()
-    
+
     private var expectedPixels = 0
     private var writeOffset = 0
     private var writeBuffer: ContiguousArray<UInt16> = []
 
     private var imageBuffer: vImage.PixelBuffer<vImage.Interleaved8x3>?
-    
+
     private let colorSpace = CGColorSpaceCreateDeviceRGB()
     private lazy var cgImageFormat = vImage_CGImageFormat(
         bitsPerComponent: 8,
@@ -45,7 +45,7 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
         decode: nil,
         renderingIntent: .defaultIntent
     )
-    
+
     func startStreaming(from url: URL) {
         stopStreaming()  // cancel + invalidate old session
         readBuffer.removeAll()
@@ -62,7 +62,7 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
         streamingTask?.cancel()
         streamingTask = nil
     }
-       
+
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
         streamState = .error("Invalid response")
         if let response = response as? HTTPURLResponse, let screenSize = response.value(forHTTPHeaderField: "Screen-Size") {
@@ -81,75 +81,83 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
         }
         completionHandler(.allow)
     }
-    
+
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         let LV_MAGIC: UInt16 = 0x564C // LV
         let HEADER_WORDS: Int = 5 // 2(LV) + 2(x) + 2(y) + 2(w) + 2(h)
-        
+
         guard case .streaming = streamState else { return }
         readBuffer.append(data)
-        
         var totalConsumed = 0
-        readBuffer.withUnsafeBytes { readBufPtr in
-            let readBuf = readBufPtr.assumingMemoryBound(to: UInt16.self)
-            writeBuffer.withUnsafeMutableBufferPointer { writeBuf in
-                while true {
-                    if headerParsed {
-                        guard let srcBase = readBuf.baseAddress, let dstBase = writeBuf.baseAddress else { streamState = .error("Decompression failed."); return  }
-                        let available = readBuf.count
-                        while readOffset < available && writeOffset < expectedPixels {
-                            let src = srcBase.advanced(by: readOffset)
-                            let header = src[0]
-                            let isRun = (header & 0x8000) != 0
-                            let count = Int(header & 0x7FFF) + (isRun ? 2 : 1)
-                            guard readOffset + 1 + (isRun ? 1 : count) <= available else { break }
-                            let dst = dstBase.advanced(by: writeOffset)
-                            if isRun {
-                                dst.initialize(repeating: src[1], count: count)
-                                readOffset += 2
-                            } else { // isLiteral
-                                dst.update(from: src.advanced(by: 1), count: count)
-                                readOffset += 1 + count
-                            }
-                            writeOffset += count
+        while true {
+            let available = (readBuffer.count - totalConsumed) / 2  // words available from cursor
+            if !headerParsed {
+                guard available >= HEADER_WORDS else { break }
+
+                readBuffer.withUnsafeBytes { rawPtr in
+                    let words = rawPtr.baseAddress!
+                        .advanced(by: totalConsumed)
+                        .assumingMemoryBound(to: UInt16.self)
+                    let magic = words[0]
+                    guard magic == LV_MAGIC else { streamState = .error("Out of sync."); return }
+                    (x, y, w, h) = (Int(words[1]), Int(words[2]), Int(words[3]), Int(words[4]))
+                }
+                expectedPixels = w * h
+                readOffset = HEADER_WORDS
+                writeOffset = 0
+                headerParsed = true
+            }
+            var didCompleteFrame = false
+            readBuffer.withUnsafeBytes { rawPtr in
+                let srcBase = rawPtr.baseAddress!
+                    .advanced(by: totalConsumed)
+                    .assumingMemoryBound(to: UInt16.self)
+                let frameWords = (readBuffer.count - totalConsumed) / 2
+                writeBuffer.withUnsafeMutableBufferPointer { writeBuf in
+                    while readOffset < frameWords && writeOffset < expectedPixels {
+                        let header = srcBase[readOffset]
+                        let isRun = (header & 0x8000) != 0
+                        let count = Int(header & 0x7FFF) + (isRun ? 2 : 1)
+                        guard readOffset + 1 + (isRun ? 1 : count) <= frameWords else { break }
+                        let dst = writeBuf.baseAddress!.advanced(by: writeOffset)
+                        if isRun {
+                            dst.initialize(repeating: srcBase[readOffset + 1], count: count)
+                            readOffset += 2
+                        } else {
+                            dst.update(from: srcBase.advanced(by: readOffset + 1), count: count)
+                            readOffset += 1 + count
                         }
-                        guard writeOffset >= expectedPixels else { break } // need more data for frame
-                        headerParsed = false
-                        imageBuffer?.withUnsafeRegionOfInterest(CGRect(x: x, y: y, width: w, height: h)) { roiBuffer in
-                            roiBuffer.withUnsafeVImageBuffer { dst in
-                                var src = vImage_Buffer(
-                                    data: UnsafeMutableRawPointer(mutating: writeBuf.baseAddress!),
-                                    height: vImagePixelCount(h),
-                                    width: vImagePixelCount(w),
-                                    rowBytes: w * MemoryLayout<UInt16>.size
-                                )
-                                var mutableDst = dst
-                                vImageConvert_RGB565toRGB888(&src, &mutableDst, vImage_Flags(kvImageNoFlags))
-                            }
-                        }
-                        DispatchQueue.main.async {
-                            self.cgImage = self.imageBuffer?.makeCGImage(cgImageFormat: self.cgImageFormat)
-                        }
-                        totalConsumed = readOffset * 2
-                        break
+                        writeOffset += count
                     }
-                    else  {
-                        guard readBuf.count >= HEADER_WORDS else { print("waiting for header..."); return }
-                        guard readBuf[0] == LV_MAGIC else { streamState = .error("Out of sync."); return }
-                        (x,y,w,h) = (Int(readBuf[1]), Int(readBuf[2]), Int(readBuf[3]), Int(readBuf[4]))
-                        expectedPixels = w * h
-                        readOffset = HEADER_WORDS
-                        writeOffset = 0
-                        headerParsed = true
+
+                    if writeOffset >= expectedPixels {
+                        didCompleteFrame = true
+                        headerParsed = false
+                        totalConsumed += readOffset * 2
                     }
                 }
             }
+            guard didCompleteFrame else { break }  // wait for more data
+            imageBuffer?.withUnsafeRegionOfInterest(CGRect(x: x, y: y, width: w, height: h)) { roiBuffer in
+                roiBuffer.withUnsafeVImageBuffer { dst in
+                    var src = vImage_Buffer(
+                        data: UnsafeMutableRawPointer(mutating: writeBuffer.withUnsafeMutableBytes { $0.baseAddress! }),
+                        height: vImagePixelCount(h),
+                        width: vImagePixelCount(w),
+                        rowBytes: w * MemoryLayout<UInt16>.size
+                    )
+                    var mutableDst = dst
+                    vImageConvert_RGB565toRGB888(&src, &mutableDst, vImage_Flags(kvImageNoFlags))
+                }
+            }
+            DispatchQueue.main.async {
+                self.cgImage = self.imageBuffer?.makeCGImage(cgImageFormat: self.cgImageFormat)
+            }
         }
-        
         if totalConsumed == readBuffer.count {
             readBuffer.removeAll(keepingCapacity: true)
         } else if totalConsumed > 0 {
-            print("consumed \(totalConsumed) remaining: \(readBuffer.count - totalConsumed)")
+            //print("removed \(totalConsumed) at front of \(readBuffer.count)")
             readBuffer.removeSubrange(0..<totalConsumed)
         }
     }
