@@ -54,6 +54,7 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
         stopStreaming()  // cancel + invalidate old session
         readBuffer.removeAll()
         readCursor = 0
+        readOffset = 0
         headerParsed = false
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 10
@@ -111,49 +112,49 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
         while true {
             var didCompleteFrame = false
             readBuffer.withUnsafeBytes { readBufPtr in
-                let available = (readBuffer.count - readCursor) / 2
-                if let src = readBufPtr.baseAddress?.advanced(by: readCursor).bindMemory(to: UInt16.self, capacity: available) {
-                    if !headerParsed {
-                        guard available >= HEADER_WORDS else { return }
-                        guard src[0] == LV_MAGIC else { streamState = .error("Out of sync."); return }
-                        (x, y, w, h) = (Int(src[1]), Int(src[2]), Int(src[3]), Int(src[4]))
-                        writeVImageBuffer.height = vImagePixelCount(h)
-                        writeVImageBuffer.width = vImagePixelCount(w)
-                        writeVImageBuffer.rowBytes = w * MemoryLayout<UInt16>.size
-                        expectedPixels = w * h
-                        readOffset = HEADER_WORDS
-                        writeOffset = 0
-                        headerParsed = true
-                    }
-                    writeBuffer.withUnsafeMutableBufferPointer { writeBufPtr in
-                        while readOffset < available && writeOffset < expectedPixels {
-                            let header = src[readOffset]
-                            let isRun = (header & 0x8000) != 0
-                            let count = Int(header & 0x7FFF) + (isRun ? 2 : 1)
-                            guard readOffset + 1 + (isRun ? 1 : count) <= available else { break }
-                            let dst = writeBufPtr.baseAddress!.advanced(by: writeOffset)
-                            if isRun {
-                                dst.initialize(repeating: src[readOffset + 1], count: count)
-                                readOffset += 2
-                            } else {
-                                dst.update(from: src.advanced(by: readOffset + 1), count: count)
-                                readOffset += 1 + count
-                            }
-                            writeOffset += count
+                let totalWords = readBuffer.count / 2
+                let available = totalWords - (readCursor/2)
+                guard let src = readBufPtr.baseAddress?.bindMemory(to: UInt16.self, capacity: totalWords).advanced(by: readCursor/2) else { return }
+                if !headerParsed {
+                    guard available >= HEADER_WORDS else { return }
+                    guard src[0] == LV_MAGIC else { streamState = .error("Out of sync."); return }
+                    (x, y, w, h) = (Int(src[1]), Int(src[2]), Int(src[3]), Int(src[4]))
+                    writeVImageBuffer.height = vImagePixelCount(h)
+                    writeVImageBuffer.width = vImagePixelCount(w)
+                    writeVImageBuffer.rowBytes = w * MemoryLayout<UInt16>.size
+                    expectedPixels = w * h
+                    readOffset = HEADER_WORDS
+                    writeOffset = 0
+                    headerParsed = true
+                }
+                writeBuffer.withUnsafeMutableBufferPointer { writeBufPtr in
+                    while readOffset < available && writeOffset < expectedPixels {
+                        let header = src[readOffset]
+                        let isRun = (header & 0x8000) != 0
+                        let count = Int(header & 0x7FFF) + (isRun ? 2 : 1)
+                        guard readOffset + 1 + (isRun ? 1 : count) <= available else { break }
+                        let dst = writeBufPtr.baseAddress!.advanced(by: writeOffset)
+                        if isRun {
+                            dst.initialize(repeating: src[readOffset + 1], count: count)
+                            readOffset += 2
+                        } else {
+                            dst.update(from: src.advanced(by: readOffset + 1), count: count)
+                            readOffset += 1 + count
                         }
-                        if writeOffset >= expectedPixels {
-                            didCompleteFrame = true
-                            headerParsed = false
-                            readCursor += readOffset * 2
-                            imageBuffer?.withUnsafeRegionOfInterest(CGRect(x: x, y: y, width: w, height: h)) { roiBuffer in
-                                roiBuffer.withUnsafeVImageBuffer { dst in
-                                    var mutableDst = dst
-                                    vImageConvert_RGB565toRGB888(&writeVImageBuffer, &mutableDst, vImage_Flags(kvImageNoFlags))
-                                }
+                        writeOffset += count
+                    }
+                    if writeOffset >= expectedPixels {
+                        didCompleteFrame = true
+                        headerParsed = false
+                        readCursor += readOffset * 2
+                        imageBuffer?.withUnsafeRegionOfInterest(CGRect(x: x, y: y, width: w, height: h)) { roiBuffer in
+                            roiBuffer.withUnsafeVImageBuffer { dst in
+                                var mutableDst = dst
+                                vImageConvert_RGB565toRGB888(&writeVImageBuffer, &mutableDst, vImage_Flags(kvImageNoFlags))
                             }
-                            DispatchQueue.main.async {
-                                self.cgImage = self.imageBuffer?.makeCGImage(cgImageFormat: self.cgImageFormat)
-                            }
+                        }
+                        DispatchQueue.main.async {
+                            self.cgImage = self.imageBuffer?.makeCGImage(cgImageFormat: self.cgImageFormat)
                         }
                     }
                 }
@@ -166,6 +167,7 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
         if readCursor == readBuffer.count {
             readBuffer.removeAll(keepingCapacity: true)
             readCursor = 0
+            readOffset = 0
         } else {
             print("remained: \(readBuffer.count - readCursor) bytes")
         }
