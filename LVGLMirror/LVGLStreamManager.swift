@@ -26,8 +26,9 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
     private var (x,y,w,h) = (0,0,0,0)
     private var headerParsed = false
 
-    private var readOffset = 0
-    private var readBuffer = Data()
+    private var readBuffer: ContiguousArray<UInt16> = []
+    private var readOffset = 0  // in words
+    private var dataOffset = 0  // in bytes
 
     private var expectedPixels = 0
     private var writeOffset = 0
@@ -70,6 +71,7 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
             let parts = screenSize.split(separator: "x")
             if parts.count == 2, let w = Int(parts[0]), let h = Int(parts[1]) {
                 aspectRatio = CGFloat(w) / CGFloat(h)
+                readBuffer = ContiguousArray<UInt16>(unsafeUninitializedCapacity: w * h) { _, count in count = w * h }
                 writeBuffer = ContiguousArray<UInt16>(unsafeUninitializedCapacity: w * h) { _, count in count = w * h }
                 writeVImageBuffer = vImage_Buffer(
                     data: UnsafeMutableRawPointer(mutating: writeBuffer.withUnsafeMutableBytes { $0.baseAddress! }),
@@ -83,7 +85,7 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
                     _ = memset(dataPtr, 0, buf.rowBytes * h)
                 }
                 cgImage = nil
-                readBuffer.removeAll()
+                dataOffset = 0
                 readOffset = 0
                 headerParsed = false
                 streamState = .streaming
@@ -98,24 +100,27 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
         let HEADER_WORDS: Int = 5 // 2(LV) + 2(x) + 2(y) + 2(w) + 2(h)
 
         guard case .streaming = streamState else { return }
-        readBuffer.append(data)
         
+        data.withUnsafeBytes { src in
+            let raw = UnsafeMutableRawPointer(readBuffer.withUnsafeMutableBufferPointer { $0.baseAddress! })
+            raw.advanced(by: dataOffset).copyMemory(from: src.baseAddress!, byteCount: src.count)
+            dataOffset += src.count
+        }
+        let totalWords = dataOffset / 2
+
 //        let now = Date()
 //        let delta = Int(now.timeIntervalSince(lastRead) * 1000)
 //        let fmt = DateFormatter()
 //        fmt.dateFormat = "HH:mm:ss.SSS"
 //        print("\(fmt.string(from: now)) read \(data.count) +\(delta)ms")
 //        lastRead = now
-
-        let totalWords = readBuffer.count / 2
-
-        readBuffer.withUnsafeBytes { readBufPtr in
-            guard let src = readBufPtr.baseAddress?.bindMemory(to: UInt16.self, capacity: totalWords) else { return }
+       
+        readBuffer.withUnsafeMutableBufferPointer { readBufPtr in
             writeBuffer.withUnsafeMutableBufferPointer { writeBufPtr in
                 while true {
                     if !headerParsed {
                         guard totalWords - readOffset >= HEADER_WORDS else { return }
-                        let p = src.advanced(by: readOffset)
+                        let p = readBufPtr.baseAddress!.advanced(by: readOffset)
                         guard p[0] == LV_MAGIC else { streamState = .error("Out of sync."); return }
                         (x, y, w, h) = (Int(p[1]), Int(p[2]), Int(p[3]), Int(p[4]))
                         writeVImageBuffer.height = vImagePixelCount(h)
@@ -128,7 +133,7 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
                     }
 
                     while readOffset < totalWords && writeOffset < expectedPixels {
-                        let p = src.advanced(by: readOffset)
+                        let p = readBufPtr.baseAddress!.advanced(by: readOffset)
                         let header = p[0]
                         let isRun = (header & 0x8000) != 0
                         let count = Int(header & 0x7FFF) + (isRun ? 2 : 1)
@@ -161,11 +166,18 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
         }
 
         if readOffset == totalWords {
-            readBuffer.removeAll(keepingCapacity: true)
-            readOffset = 0
+            dataOffset = 0
         } else {
-            print("remained: \(totalWords - readOffset) words")
+            let consumedBytes = readOffset * 2
+            let remainingBytes = dataOffset - consumedBytes
+//            print("moving \(remainingBytes) bytes to the front")
+            readBuffer.withUnsafeMutableBufferPointer { buf in
+                let raw = UnsafeMutableRawPointer(buf.baseAddress!)
+                memmove(raw, raw.advanced(by: consumedBytes), remainingBytes)
+            }
+            dataOffset = remainingBytes
         }
+        readOffset = 0
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
