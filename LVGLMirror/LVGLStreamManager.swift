@@ -26,7 +26,6 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
     private var (x,y,w,h) = (0,0,0,0)
     private var headerParsed = false
 
-    private var readCursor: Int = 0
     private var readOffset = 0
     private var readBuffer = Data()
 
@@ -52,10 +51,6 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
 
     func startStreaming(from url: URL) {
         stopStreaming()  // cancel + invalidate old session
-        readBuffer.removeAll()
-        readCursor = 0
-        readOffset = 0
-        headerParsed = false
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 10
         let session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
@@ -88,6 +83,9 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
                     _ = memset(dataPtr, 0, buf.rowBytes * h)
                 }
                 cgImage = nil
+                readBuffer.removeAll()
+                readOffset = 0
+                headerParsed = false
                 streamState = .streaming
                 lastRead = Date()
             }
@@ -109,67 +107,64 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
 //        print("\(fmt.string(from: now)) read \(data.count) +\(delta)ms")
 //        lastRead = now
 
-        while true {
-            var didCompleteFrame = false
-            readBuffer.withUnsafeBytes { readBufPtr in
-                let totalWords = readBuffer.count / 2
-                let available = totalWords - (readCursor/2)
-                guard let src = readBufPtr.baseAddress?.bindMemory(to: UInt16.self, capacity: totalWords).advanced(by: readCursor/2) else { return }
-                if !headerParsed {
-                    guard available >= HEADER_WORDS else { return }
-                    guard src[0] == LV_MAGIC else { streamState = .error("Out of sync."); return }
-                    (x, y, w, h) = (Int(src[1]), Int(src[2]), Int(src[3]), Int(src[4]))
-                    writeVImageBuffer.height = vImagePixelCount(h)
-                    writeVImageBuffer.width = vImagePixelCount(w)
-                    writeVImageBuffer.rowBytes = w * MemoryLayout<UInt16>.size
-                    expectedPixels = w * h
-                    readOffset = HEADER_WORDS
-                    writeOffset = 0
-                    headerParsed = true
-                }
-                writeBuffer.withUnsafeMutableBufferPointer { writeBufPtr in
-                    while readOffset < available && writeOffset < expectedPixels {
-                        let header = src[readOffset]
+        let totalWords = readBuffer.count / 2
+
+        readBuffer.withUnsafeBytes { readBufPtr in
+            guard let src = readBufPtr.baseAddress?.bindMemory(to: UInt16.self, capacity: totalWords) else { return }
+            writeBuffer.withUnsafeMutableBufferPointer { writeBufPtr in
+                while true {
+                    if !headerParsed {
+                        guard totalWords - readOffset >= HEADER_WORDS else { return }
+                        let p = src.advanced(by: readOffset)
+                        guard p[0] == LV_MAGIC else { streamState = .error("Out of sync."); return }
+                        (x, y, w, h) = (Int(p[1]), Int(p[2]), Int(p[3]), Int(p[4]))
+                        writeVImageBuffer.height = vImagePixelCount(h)
+                        writeVImageBuffer.width = vImagePixelCount(w)
+                        writeVImageBuffer.rowBytes = w * MemoryLayout<UInt16>.size
+                        expectedPixels = w * h
+                        readOffset += HEADER_WORDS
+                        writeOffset = 0
+                        headerParsed = true
+                    }
+
+                    while readOffset < totalWords && writeOffset < expectedPixels {
+                        let p = src.advanced(by: readOffset)
+                        let header = p[0]
                         let isRun = (header & 0x8000) != 0
                         let count = Int(header & 0x7FFF) + (isRun ? 2 : 1)
-                        guard readOffset + 1 + (isRun ? 1 : count) <= available else { break }
+                        let packetSize = 1 + (isRun ? 1 : count)
+                        guard readOffset + packetSize <= totalWords else { break }
                         let dst = writeBufPtr.baseAddress!.advanced(by: writeOffset)
                         if isRun {
-                            dst.initialize(repeating: src[readOffset + 1], count: count)
-                            readOffset += 2
+                            dst.initialize(repeating: p[1], count: count)
                         } else {
-                            dst.update(from: src.advanced(by: readOffset + 1), count: count)
-                            readOffset += 1 + count
+                            dst.update(from: p.advanced(by: 1), count: count)
                         }
+                        readOffset += packetSize
                         writeOffset += count
                     }
-                    if writeOffset >= expectedPixels {
-                        didCompleteFrame = true
-                        headerParsed = false
-                        readCursor += readOffset * 2
-                        imageBuffer?.withUnsafeRegionOfInterest(CGRect(x: x, y: y, width: w, height: h)) { roiBuffer in
-                            roiBuffer.withUnsafeVImageBuffer { dst in
-                                var mutableDst = dst
-                                vImageConvert_RGB565toRGB888(&writeVImageBuffer, &mutableDst, vImage_Flags(kvImageNoFlags))
-                            }
+
+                    guard writeOffset >= expectedPixels else { return }
+
+                    headerParsed = false
+                    imageBuffer?.withUnsafeRegionOfInterest(CGRect(x: x, y: y, width: w, height: h)) { roiBuffer in
+                        roiBuffer.withUnsafeVImageBuffer { dst in
+                            var mutableDst = dst
+                            vImageConvert_RGB565toRGB888(&writeVImageBuffer, &mutableDst, vImage_Flags(kvImageNoFlags))
                         }
-                        DispatchQueue.main.async {
-                            self.cgImage = self.imageBuffer?.makeCGImage(cgImageFormat: self.cgImageFormat)
-                        }
+                    }
+                    DispatchQueue.main.async {
+                        self.cgImage = self.imageBuffer?.makeCGImage(cgImageFormat: self.cgImageFormat)
                     }
                 }
             }
-            guard didCompleteFrame else { return }  // wait for more data
         }
-            
-        print("bufferSize: \(readBuffer.count)")
 
-        if readCursor == readBuffer.count {
+        if readOffset == totalWords {
             readBuffer.removeAll(keepingCapacity: true)
-            readCursor = 0
             readOffset = 0
         } else {
-            print("remained: \(readBuffer.count - readCursor) bytes")
+            print("remained: \(totalWords - readOffset) words")
         }
     }
 
