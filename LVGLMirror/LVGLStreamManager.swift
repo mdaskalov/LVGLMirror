@@ -89,7 +89,7 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
                 readOffset = 0
                 headerParsed = false
                 streamState = .streaming
-                lastRead = Date()
+//                lastRead = Date()
             }
         }
         completionHandler(.allow)
@@ -100,84 +100,79 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
         let HEADER_WORDS: Int = 5 // 2(LV) + 2(x) + 2(y) + 2(w) + 2(h)
 
         guard case .streaming = streamState else { return }
-        
-        data.withUnsafeBytes { src in
-            let raw = UnsafeMutableRawPointer(readBuffer.withUnsafeMutableBufferPointer { $0.baseAddress! })
-            raw.advanced(by: dataOffset).copyMemory(from: src.baseAddress!, byteCount: src.count)
-            dataOffset += src.count
-        }
-        let totalWords = dataOffset / 2
-
-//        let now = Date()
-//        let delta = Int(now.timeIntervalSince(lastRead) * 1000)
-//        let fmt = DateFormatter()
-//        fmt.dateFormat = "HH:mm:ss.SSS"
-//        print("\(fmt.string(from: now)) read \(data.count) +\(delta)ms")
-//        lastRead = now
-       
-        readBuffer.withUnsafeMutableBufferPointer { readBufPtr in
-            writeBuffer.withUnsafeMutableBufferPointer { writeBufPtr in
-                while true {
-                    if !headerParsed {
-                        guard totalWords - readOffset >= HEADER_WORDS else { return }
-                        let p = readBufPtr.baseAddress!.advanced(by: readOffset)
-                        guard p[0] == LV_MAGIC else { streamState = .error("Out of sync."); return }
-                        (x, y, w, h) = (Int(p[1]), Int(p[2]), Int(p[3]), Int(p[4]))
-                        writeVImageBuffer.height = vImagePixelCount(h)
-                        writeVImageBuffer.width = vImagePixelCount(w)
-                        writeVImageBuffer.rowBytes = w * MemoryLayout<UInt16>.size
-                        expectedPixels = w * h
-                        readOffset += HEADER_WORDS
-                        writeOffset = 0
-                        headerParsed = true
-                    }
-
-                    while readOffset < totalWords && writeOffset < expectedPixels {
-                        let p = readBufPtr.baseAddress!.advanced(by: readOffset)
-                        let header = p[0]
-                        let isRun = (header & 0x8000) != 0
-                        let count = Int(header & 0x7FFF) + (isRun ? 2 : 1)
-                        let packetSize = 1 + (isRun ? 1 : count)
-                        guard readOffset + packetSize <= totalWords else { break }
-                        let dst = writeBufPtr.baseAddress!.advanced(by: writeOffset)
-                        if isRun {
-                            dst.initialize(repeating: p[1], count: count)
-                        } else {
-                            dst.update(from: p.advanced(by: 1), count: count)
+        data.withUnsafeBytes { dataPtr in
+            readBuffer.withUnsafeMutableBufferPointer { readBufPtr in
+                let readBufferBytes = UnsafeMutableRawPointer(readBufPtr.baseAddress!)
+                
+                // Append new data
+                readBufferBytes.advanced(by: dataOffset).copyMemory(from: dataPtr.baseAddress!, byteCount: dataPtr.count)
+                dataOffset += dataPtr.count
+                let totalWords = dataOffset / 2
+                
+//                let now = Date()
+//                let delta = Int(now.timeIntervalSince(lastRead) * 1000)
+//                let fmt = DateFormatter()
+//                fmt.dateFormat = "HH:mm:ss.SSS"
+//                print("\(fmt.string(from: now)) read \(data.count) +\(delta)ms")
+//                lastRead = now
+                
+                writeBuffer.withUnsafeMutableBufferPointer { writeBufPtr in
+                    while true {
+                        if !headerParsed {
+                            guard totalWords - readOffset >= HEADER_WORDS else { return }
+                            let p = readBufPtr.baseAddress!.advanced(by: readOffset)
+                            guard p[0] == LV_MAGIC else { streamState = .error("Out of sync."); return }
+                            (x, y, w, h) = (Int(p[1]), Int(p[2]), Int(p[3]), Int(p[4]))
+                            writeVImageBuffer.height = vImagePixelCount(h)
+                            writeVImageBuffer.width = vImagePixelCount(w)
+                            writeVImageBuffer.rowBytes = w * MemoryLayout<UInt16>.size
+                            expectedPixels = w * h
+                            readOffset += HEADER_WORDS
+                            writeOffset = 0
+                            headerParsed = true
                         }
-                        readOffset += packetSize
-                        writeOffset += count
-                    }
-
-                    guard writeOffset >= expectedPixels else { return }
-
-                    headerParsed = false
-                    imageBuffer?.withUnsafeRegionOfInterest(CGRect(x: x, y: y, width: w, height: h)) { roiBuffer in
-                        roiBuffer.withUnsafeVImageBuffer { dst in
-                            var mutableDst = dst
-                            vImageConvert_RGB565toRGB888(&writeVImageBuffer, &mutableDst, vImage_Flags(kvImageNoFlags))
+                        while readOffset < totalWords && writeOffset < expectedPixels {
+                            let p = readBufPtr.baseAddress!.advanced(by: readOffset)
+                            let header = p[0]
+                            let isRun = (header & 0x8000) != 0
+                            let count = Int(header & 0x7FFF) + (isRun ? 2 : 1)
+                            let packetSize = 1 + (isRun ? 1 : count)
+                            guard readOffset + packetSize <= totalWords else { break }
+                            let dst = writeBufPtr.baseAddress!.advanced(by: writeOffset)
+                            if isRun {
+                                dst.initialize(repeating: p[1], count: count)
+                            } else {
+                                dst.update(from: p.advanced(by: 1), count: count)
+                            }
+                            readOffset += packetSize
+                            writeOffset += count
                         }
-                    }
-                    DispatchQueue.main.async {
-                        self.cgImage = self.imageBuffer?.makeCGImage(cgImageFormat: self.cgImageFormat)
+
+                        guard writeOffset >= expectedPixels else { return }
+
+                        headerParsed = false
+                        imageBuffer?.withUnsafeRegionOfInterest(CGRect(x: x, y: y, width: w, height: h)) { roiBuffer in
+                            roiBuffer.withUnsafeVImageBuffer { dst in
+                                var mutableDst = dst
+                                vImageConvert_RGB565toRGB888(&writeVImageBuffer, &mutableDst, vImage_Flags(kvImageNoFlags))
+                            }
+                        }
+                        DispatchQueue.main.async {
+                            self.cgImage = self.imageBuffer?.makeCGImage(cgImageFormat: self.cgImageFormat)
+                        }
                     }
                 }
+                if readOffset == totalWords {
+                    dataOffset = 0
+                } else {
+                    let consumedBytes = readOffset * 2
+                    let remainingBytes = dataOffset - consumedBytes
+                    memmove(readBufferBytes, readBufferBytes.advanced(by: consumedBytes), remainingBytes)
+                    dataOffset = remainingBytes
+                }
+                readOffset = 0
             }
         }
-
-        if readOffset == totalWords {
-            dataOffset = 0
-        } else {
-            let consumedBytes = readOffset * 2
-            let remainingBytes = dataOffset - consumedBytes
-//            print("moving \(remainingBytes) bytes to the front")
-            readBuffer.withUnsafeMutableBufferPointer { buf in
-                let raw = UnsafeMutableRawPointer(buf.baseAddress!)
-                memmove(raw, raw.advanced(by: consumedBytes), remainingBytes)
-            }
-            dataOffset = remainingBytes
-        }
-        readOffset = 0
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
