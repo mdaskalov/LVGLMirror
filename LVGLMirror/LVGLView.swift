@@ -7,51 +7,14 @@
 
 import SwiftUI
 
-@Observable
-class TouchThrottle {
-    private var timer: Timer?
-    private var pendingX: Int = 0
-    private var pendingY: Int = 0
-    
-    var onSend: ((Int, Int, Int) -> Void)?
-    
-    func touchChanged(x: Int, y: Int) {
-        pendingX = x
-        pendingY = y
-        
-        guard timer == nil else { return }
-        
-        onSend?(x, y, 1)
-        
-        timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            self.onSend?(self.pendingX, self.pendingY, 1)
-        }
-    }
-    
-    func touchEnded(x: Int, y: Int) {
-        timer?.invalidate()
-        timer = nil
-        onSend?(x, y, 0)
-    }
-}
-
 struct LVGLView: View {
     @StateObject var streamManager = LVGLStreamManager()
-    @State var host: String = "office-th"
     
     private var touchTimer: Timer?
     private var pendingTouchX: Int = 0
     private var pendingTouchY: Int = 0
     private var pendingTouches: Int = 0
-    
-    func normalizedTouch(at p: CGPoint, in s: CGSize, on i: CGImage) -> (Int, Int) {
-        (
-            Int(p.x * CGFloat(i.width) / s.width),
-            Int(p.y * CGFloat(i.height) / s.height)
-        )
-    }
-    
+       
     var body: some View {
         VStack {
             Group {
@@ -72,6 +35,8 @@ struct LVGLView: View {
                                         .gesture(dragGestureIn(geometry: g))
                                 }
                             )
+                    } else {
+                        Color.clear
                     }
                 case .error(let message):
                     Text("Error: \(message)")
@@ -86,21 +51,22 @@ struct LVGLView: View {
                 case .started, .streaming: true
                 default: false
                 }
-                TextField("Host", text: $host)
+                TextField("Host", text: $streamManager.host)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
-                Button(action: { streaming ? streamManager.stopStreaming() : streamManager.startStreaming(from: host) }) {
+                    .onSubmit(streamManager.startStreaming)
+                Button(action: streaming ? streamManager.stopStreaming : streamManager.startStreaming) {
                     Image(systemName: streaming ? "stop.fill" : "play.fill")
-                        .font(.title2)
-                        .fontWeight(.bold)
+                        .imageScale(.large)
+                        .frame(width: 20, height: 20)
                 }
                 .buttonBorderShape(.circle)
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
             }
-            .padding()
+            .padding([.leading, .bottom, .trailing])
         }
     }
-    
+
     func dragGestureIn(geometry: GeometryProxy) -> some Gesture {
         DragGesture(minimumDistance: 0)
             .onChanged { value in

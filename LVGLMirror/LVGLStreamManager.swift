@@ -20,11 +20,10 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
     let LV_MAGIC: UInt16 = 0x564C // LV
     let HEADER_WORDS: Int = 5 // 2(LV) + 2(x) + 2(y) + 2(w) + 2(h)
 
+    @Published var host = "office-th"
     @Published var streamState: LVGLStreamState = .idle
     @Published var cgImage: CGImage?
     @Published var aspectRatio: CGFloat = 1.0
-    
-    private var host = ""
 
     private var streamingTask: URLSessionDataTask?
 
@@ -58,9 +57,8 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
         renderingIntent: .defaultIntent
     )
 
-    func startStreaming(from host: String) {
-        self.host = host
-        stopStreaming()  // cancel + invalidate old session
+    func startStreaming() {
+        stopStreaming()
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 10
         let session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
