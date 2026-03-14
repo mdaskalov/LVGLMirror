@@ -17,9 +17,14 @@ enum LVGLStreamState: Equatable {
 }
 
 class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
+    let LV_MAGIC: UInt16 = 0x564C // LV
+    let HEADER_WORDS: Int = 5 // 2(LV) + 2(x) + 2(y) + 2(w) + 2(h)
+
     @Published var streamState: LVGLStreamState = .idle
     @Published var cgImage: CGImage?
     @Published var aspectRatio: CGFloat = 1.0
+    
+    private var host = ""
 
     private var streamingTask: URLSessionDataTask?
 
@@ -37,6 +42,9 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
 
     private var imageBuffer: vImage.PixelBuffer<vImage.Interleaved8x3>?
     
+    private var touchTimer: Timer?
+    private var touchLastLocation: CGPoint = .zero
+    
     var lastRead = Date()
 
     private let colorSpace = CGColorSpaceCreateDeviceRGB()
@@ -50,11 +58,13 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
         renderingIntent: .defaultIntent
     )
 
-    func startStreaming(from url: URL) {
+    func startStreaming(from host: String) {
+        self.host = host
         stopStreaming()  // cancel + invalidate old session
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 10
         let session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
+        guard let url = URL(string: "http://\(host):8881") else { streamState = .error("Invalid host"); return }
         streamingTask = session.dataTask(with: url)
         streamState = .started
         streamingTask?.resume()
@@ -71,8 +81,9 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
             let parts = screenSize.split(separator: "x")
             if parts.count == 2, let w = Int(parts[0]), let h = Int(parts[1]) {
                 aspectRatio = CGFloat(w) / CGFloat(h)
-                readBuffer = ContiguousArray<UInt16>(unsafeUninitializedCapacity: w * h) { _, count in count = w * h }
-                writeBuffer = ContiguousArray<UInt16>(unsafeUninitializedCapacity: w * h) { _, count in count = w * h }
+                let bufSize = HEADER_WORDS + (w * h)
+                readBuffer = ContiguousArray<UInt16>(unsafeUninitializedCapacity: bufSize) { _, count in count = bufSize }
+                writeBuffer = ContiguousArray<UInt16>(unsafeUninitializedCapacity: bufSize) { _, count in count = bufSize }
                 writeVImageBuffer = vImage_Buffer(
                     data: UnsafeMutableRawPointer(mutating: writeBuffer.withUnsafeMutableBytes { $0.baseAddress! }),
                     height: vImagePixelCount(h),
@@ -96,9 +107,6 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
     }
    
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        let LV_MAGIC: UInt16 = 0x564C // LV
-        let HEADER_WORDS: Int = 5 // 2(LV) + 2(x) + 2(y) + 2(w) + 2(h)
-
         guard case .streaming = streamState else { return }
         data.withUnsafeBytes { dataPtr in
             readBuffer.withUnsafeMutableBufferPointer { readBufPtr in
@@ -182,5 +190,42 @@ class LVGLStreamManager: NSObject, ObservableObject, URLSessionDataDelegate {
         } else {
             if case .streaming = streamState { streamState = .idle }
         }
+    }
+    
+    private func sendTouch(at location: CGPoint, touches: Int) {
+        guard let url = URL(string: "http://\(host)/lvgl_touch") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.httpBody = "x=\(Int(location.x))&y=\(Int(location.y))&t=\(touches)".data(using: .utf8)
+        URLSession.shared.dataTask(with: request).resume()
+    }
+        
+    private func normalizedTouch(at location: CGPoint, in g: GeometryProxy) -> CGPoint {
+        let imageWidth = CGFloat(cgImage?.width ?? 0)
+        let imageHeight = CGFloat(cgImage?.height ?? 0)
+        let rawX = location.x * imageWidth / g.size.width
+        let x = min(max(rawX, 0), imageWidth)
+        let rawY = location.y * imageHeight / g.size.height
+        let y = min(max(rawY, 0), imageHeight)
+        return CGPoint(x: x, y: y)
+    }
+       
+    func touchChanged(to location: CGPoint, in g: GeometryProxy) {
+        touchLastLocation = normalizedTouch(at: location, in: g)
+        guard touchTimer == nil else { return }
+        sendTouch(at: touchLastLocation, touches: 1)
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.sendTouch(at: self.touchLastLocation, touches: 1)
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        touchTimer = timer
+    }
+    
+    func touchEnded(at location: CGPoint, in g: GeometryProxy) {
+        touchTimer?.invalidate()
+        touchTimer = nil
+        sendTouch(at: normalizedTouch(at: location, in: g), touches: 0)
     }
 }

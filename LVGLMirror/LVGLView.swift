@@ -7,9 +7,50 @@
 
 import SwiftUI
 
+@Observable
+class TouchThrottle {
+    private var timer: Timer?
+    private var pendingX: Int = 0
+    private var pendingY: Int = 0
+    
+    var onSend: ((Int, Int, Int) -> Void)?
+    
+    func touchChanged(x: Int, y: Int) {
+        pendingX = x
+        pendingY = y
+        
+        guard timer == nil else { return }
+        
+        onSend?(x, y, 1)
+        
+        timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.onSend?(self.pendingX, self.pendingY, 1)
+        }
+    }
+    
+    func touchEnded(x: Int, y: Int) {
+        timer?.invalidate()
+        timer = nil
+        onSend?(x, y, 0)
+    }
+}
+
 struct LVGLView: View {
     @StateObject var streamManager = LVGLStreamManager()
     @State var host: String = "office-th"
+    
+    private var touchTimer: Timer?
+    private var pendingTouchX: Int = 0
+    private var pendingTouchY: Int = 0
+    private var pendingTouches: Int = 0
+    
+    func normalizedTouch(at p: CGPoint, in s: CGSize, on i: CGImage) -> (Int, Int) {
+        (
+            Int(p.x * CGFloat(i.width) / s.width),
+            Int(p.y * CGFloat(i.height) / s.height)
+        )
+    }
     
     var body: some View {
         VStack {
@@ -26,27 +67,11 @@ struct LVGLView: View {
                             .aspectRatio(streamManager.aspectRatio, contentMode: .fit)
                             .overlay(
                                 GeometryReader { g in
-                                    let scaleX = CGFloat(cgImage.width) / g.size.width
-                                    let scaleY = CGFloat(cgImage.height) / g.size.height
                                     Color.clear
                                         .contentShape(Rectangle())
-                                        .gesture(
-                                            DragGesture(minimumDistance: 0)
-                                                .onChanged { value in
-                                                    let x = Int(value.location.x * scaleX)
-                                                    let y = Int(value.location.y * scaleY)
-                                                    sendTouchEvent(atX: x, y: y, touches: 1)
-                                                }
-                                                .onEnded { value in
-                                                    let x = Int(value.location.x * scaleX)
-                                                    let y = Int(value.location.y * scaleY)
-                                                    sendTouchEvent(atX: x, y: y, touches: 0)
-                                                }
-                                        )
+                                        .gesture(dragGestureIn(geometry: g))
                                 }
                             )
-                    } else {
-                        Color.clear
                     }
                 case .error(let message):
                     Text("Error: \(message)")
@@ -63,13 +88,7 @@ struct LVGLView: View {
                 }
                 TextField("Host", text: $host)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
-                Button(action: {
-                    if streaming {
-                        streamManager.stopStreaming()
-                    } else if let url = URL(string: "http://\(host):8881") {
-                        streamManager.startStreaming(from: url)
-                    }
-                }) {
+                Button(action: { streaming ? streamManager.stopStreaming() : streamManager.startStreaming(from: host) }) {
                     Image(systemName: streaming ? "stop.fill" : "play.fill")
                         .font(.title2)
                         .fontWeight(.bold)
@@ -77,23 +96,19 @@ struct LVGLView: View {
                 .buttonBorderShape(.circle)
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
-                
             }
             .padding()
         }
     }
     
-    private func sendTouchEvent(atX x: Int, y: Int, touches: Int) {
-        guard let url = URL(string: "http://\(host)/lvgl_touch") else { return }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        request.httpBody = "x=\(x)&y=\(y)&t=\(touches)".data(using: .utf8)
-        URLSession.shared.dataTask(with: request) { _, _, error in
-            if let error = error {
-                print("Touch event error: \(error)")
+    func dragGestureIn(geometry: GeometryProxy) -> some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { value in
+                streamManager.touchChanged(to: value.location, in: geometry)
             }
-        }.resume()
+            .onEnded { value in
+                streamManager.touchEnded(at: value.location, in: geometry)
+            }
     }
 }
 
